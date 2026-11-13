@@ -285,7 +285,13 @@ class MoeLayer(nn.Module):
             token_inputs = jnp.pad(token_inputs, ((0, padding), (0, 0)))
         num_routing_tokens = num_tokens + padding
 
-        num_groups = _num_groups(num_routing_tokens, self.max_group_size, self.num_experts)
+        if enable_dropout:
+            num_groups = _num_groups(num_routing_tokens, self.max_group_size, self.num_experts)
+        else:
+            # Batch-four training has one token per routing group. Keep this
+            # independent routing at inference, so a smaller batch cannot make
+            # real tokens compete for an expert's fixed capacity.
+            num_groups = num_routing_tokens
         tokens_per_group = num_routing_tokens // num_groups
 
         if enable_dropout:  # Training

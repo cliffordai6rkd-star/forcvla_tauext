@@ -28,6 +28,8 @@
 虽然目录名包含 `3cam`，当前元数据和视频实际只有 front、right_wrist 两路。
 `left_wrist_0_rgb` 补零且 mask 为 false。以后增加第三路时可设置
 `--data.left-wrist-image-key observation.images.left_wrist`，同时重新计算对应统计。
+这里已经使用黑图补齐缺失视角；黑图经归一化和 SigLIP 编码后不等于零特征。
+对现有 checkpoint，应保留相同填充和 mask，不能只在推理时复制其他视角或把 mask 改成 true。
 
 动作 horizon 为 50，即 2 秒。动作序列只在当前 episode 内取样，末尾重复最后
 一个动作；力矩只取当前帧。七个关节全部做 delta 转换，第七维不当作夹爪。
@@ -94,16 +96,24 @@ JAX_PLATFORMS=cpu python scripts/compute_norm_stats.py --config-name pi0_force_l
 
 ## 单样本推理验证
 
-推理在每个去噪步骤复用预填充阶段的 `prefix_out_fix`；仅计算 suffix 时返回的
-`prefix_out` 为 `None`，不能用于拼接。标准输入有 817 个 MoE token，单样本时
-补齐到 820 个用于路由，再裁回 817 个。原 batch 4 的路由无需补零，输出保持一致；
-此次修复不改变参数名称或形状，已有 checkpoint 可直接加载。
+推理在每个去噪步骤联合重算 prefix 和 suffix，使用与 `compute_loss` 相同的
+注意力 mask、位置和力融合公式；图像与文本的初始编码只需计算一次。现有注意力
+实现对完全被 mask 的 query 行仍产生输出，后续 MoE 也读取这些行，故对现有
+checkpoint 不能只缓存 prefix 的 LLM 输出。联合重算保留训练时的计算语义，代价是
+推理速度下降；此次没有更改训练的 mask 语义，也没有改变参数名称或形状。
 
-已分别加载 `huanggua_tau_ext_b4/49999` 和 `board_tau_ext_b4/49999`，各用两个真实
-数据样本执行单条离线推理（`num_steps=2`），四次输出均为 `(50, 7)` 且数值有限。
-这验证了 checkpoint 加载及推理路径，尚未验证实机任务成功率。
+标准输入有 817 个 MoE token。训练 batch 4 共 3268 个 token，原路由恰好是
+每组 1 个 token、每专家容量 4。单样本仅补齐到 820 个再自动选组，会产生每组
+5 个 token；若全选同一专家，其中 1 个会因容量不足被丢弃。现在推理固定每组
+1 个 token（单样本 820 组），路由后裁回 817 个，沿用训练时的独立路由方式。
+训练模式的分组算法保留，原 batch 4 的路由输出与旧路径逐元素一致。
 
-现有注意力实现对完全被 mask 的 prefix query 行仍会产生输出，而后续 MoE 也读取
-这些行。因此有缺失相机或文本 padding 时，缓存推理与每一步联合重算 prefix/suffix
-可能存在数值差异。此次仅修复上述运行错误，保留现有训练和 mask 语义；前述离线
-推理结果不代表这两种前向计算已经数值对齐。
+回归测试覆盖缺失相机、文本 padding 及二者同时存在时的联合前向一致性，另用
+全部选择同一专家的构造输入验证 token 不再因单样本分组而丢弃，并对比 batch
+1 / 4 的路由输出。实机任务成功率仍需单独评估。
+
+已对黄瓜、擦板的 `*_tau_ext_b4/49999` 各取一个真实样本，用相同初始 noise
+比较单样本推理与 batch 4 联合前向参考（2 个去噪步骤）。真实输入为前视/右腕
+mask true、左腕 false，文本 6/48 个 token 有效。两份还原后 7 关节动作的最大
+误差分别为 0.00078 / 0.00152 rad，低于预先设定的 0.005 rad 容差；bfloat16
+跨 batch 计算仍非逐位一致。两份 `Policy.infer` 均输出 `(50, 7)` 且数值有限。
