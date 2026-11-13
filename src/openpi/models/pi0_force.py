@@ -336,7 +336,9 @@ class Pi0_Guidance(_model.BaseModel):
             )
             assert prefix_out is None
 
-            limoe_out = self.limoe(jnp.concatenate([prefix_out, force_tokens], axis=1)) ## prefix_out is vlm
+            # Suffix-only decoding returns no prefix output; reuse the prefill
+            # output cached before denoising.
+            limoe_out = self.limoe(jnp.concatenate([prefix_out_fix, force_tokens], axis=1))
             v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
             # v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 

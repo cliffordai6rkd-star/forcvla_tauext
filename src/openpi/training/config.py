@@ -630,8 +630,7 @@ def _pi0_force_lora_v3_config(name: str, dataset_name: str, prompt: str) -> Trai
         weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         freeze_filter=model.get_freeze_filter(),
         ema_decay=None,
-        # Global batch: two samples per GPU on two RTX 4090s. The current
-        # four-expert MoE requires a global batch divisible by four.
+        # Global batch: two samples per GPU on two RTX 4090s.
         batch_size=4,
         fsdp_devices=2,
         num_workers=4,

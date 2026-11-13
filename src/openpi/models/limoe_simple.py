@@ -276,9 +276,17 @@ class MoeLayer(nn.Module):
         # pdb.set_trace()
         batch_size, seq_length, hidden_dim = inputs.shape
         num_tokens = batch_size * seq_length
+        # Expert dispatch reshapes groups into num_experts-sized blocks. Pad
+        # only the routing input; attention and the returned sequence stay at
+        # their original lengths. Routers ignore the added all-zero tokens.
+        padding = (-num_tokens) % self.num_experts
+        token_inputs = inputs.reshape((num_tokens, hidden_dim))
+        if padding:
+            token_inputs = jnp.pad(token_inputs, ((0, padding), (0, 0)))
+        num_routing_tokens = num_tokens + padding
 
-        num_groups = _num_groups(num_tokens, self.max_group_size, self.num_experts)
-        tokens_per_group = num_tokens // num_groups
+        num_groups = _num_groups(num_routing_tokens, self.max_group_size, self.num_experts)
+        tokens_per_group = num_routing_tokens // num_groups
 
         if enable_dropout:  # Training
             capacity_factor = self.train_capacity_factor
@@ -290,7 +298,7 @@ class MoeLayer(nn.Module):
         expert_capacity = max(expert_capacity, self.min_expert_capacity)
 
         # Reshape batch and sequence/token dimensions for expert routing.
-        token_inputs = jnp.reshape(inputs,
+        token_inputs = jnp.reshape(token_inputs,
                                 (num_groups, tokens_per_group, hidden_dim))
 
         # pdb.set_trace()
@@ -315,7 +323,8 @@ class MoeLayer(nn.Module):
             raise ValueError(f'Unrecognized router type: {self.router}')
 
         # Return to original input shape.
-        result = outputs.reshape((batch_size, seq_length, hidden_dim))
+        result = outputs.reshape((num_routing_tokens, hidden_dim))[:num_tokens]
+        result = result.reshape((batch_size, seq_length, hidden_dim))
         return result
 
     def _scatter_to_experts(self, token_inputs: Array, enable_dropout: bool,
@@ -665,8 +674,11 @@ def _num_groups(num_tokens: int, max_group_size: int, num_experts: int) -> int:
     """
     # For pjit-based partitioning, we manipulated arrays globally. The number of
     # experts must evenly divide the number of (global) groups.
-    min_num_groups = num_tokens // max_group_size
+    if num_tokens <= 0 or max_group_size <= 0 or num_experts <= 0:
+        raise ValueError('num_tokens, max_group_size, and num_experts must be positive')
+    min_num_groups = (num_tokens + max_group_size - 1) // max_group_size
     min_num_groups = max(min_num_groups, num_experts)
+    min_num_groups = ((min_num_groups + num_experts - 1) // num_experts) * num_experts
 
     def viable(n):
         """Returns true iff n is a viable number of groups."""
@@ -676,9 +688,9 @@ def _num_groups(num_tokens: int, max_group_size: int, num_experts: int) -> int:
     # a viable number of groups.
     num_groups = min_num_groups
     while num_groups < num_tokens and not viable(num_groups):
-        num_groups += 1
+        num_groups += num_experts
 
-    if num_tokens % num_groups > 0:
+    if num_groups > num_tokens or not viable(num_groups):
         raise ValueError(
             'Group size and the number of experts must divide evenly into the '
             f'global number of tokens, but num_tokens={num_tokens}, while '
