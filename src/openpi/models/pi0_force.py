@@ -177,7 +177,8 @@ class Pi0_Guidance(_model.BaseModel):
         #     rngs=rngs
         # )
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
-        self.force_in_proj = nnx.Linear(6, paligemma_config.width, rngs=rngs)
+        # The force-guidance branch receives all seven external joint torques.
+        self.force_in_proj = nnx.Linear(7, paligemma_config.width, rngs=rngs)
         print("paligemma_config.width: ", paligemma_config.width)
         self.limoe = nnx_bridge.ToNNX(
             _limoe.LIMoEBlock(
@@ -188,7 +189,7 @@ class Pi0_Guidance(_model.BaseModel):
                 out_dim=action_expert_config.width,
             )
         )
-        self.limoe.lazy_init(jnp.zeros((32, 200, paligemma_config.width)), True, rngs=rngs)
+        self.limoe.lazy_init(jnp.zeros((1, 200, paligemma_config.width)), True, rngs=rngs)
 
     @at.typecheck
     def embed_prefix(
@@ -227,13 +228,13 @@ class Pi0_Guidance(_model.BaseModel):
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], at.Float[at.Array, "b 1 2*emb"]]:  # b t emb2
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], at.Float[at.Array, "b 1 vlm_emb"]]:
         input_mask = []
         ar_mask = []
         tokens = []
-        # obs.state is shape [b, 13] (13 = 7 prio + 6 force, ee pose: xyz+rpy, gripper)
+        # obs.state: [robot proprioception (7), tau_ext (7), padding].
         observations = jnp.zeros_like(obs.state)
-        observations = observations.at[:, :7].set(obs.state[:, :7]) ## robot state, xyz + rpy + gripper
+        observations = observations.at[:, :7].set(obs.state[:, :7])
         state_token = self.state_proj(observations)[:, None, :] # [b, 1, d]
         # state_token = self.state_proj(obs.state)[:, None, :] # [b, 1, d]
         tokens.append(state_token)
@@ -256,7 +257,7 @@ class Pi0_Guidance(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        force_tokens = self.force_in_proj(obs.state[:, 7:13])[:, None, :] # [b, 1, 2emb]
+        force_tokens = self.force_in_proj(obs.state[:, 7:14])[:, None, :] # [b, 1, vlm_emb]
         return tokens, input_mask, ar_mask, force_tokens
 
     @override

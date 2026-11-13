@@ -1,4 +1,7 @@
 import pathlib
+import concurrent.futures
+import itertools
+import threading
 
 import pytest
 
@@ -22,6 +25,58 @@ def test_download_local(tmp_path: pathlib.Path):
 
     with pytest.raises(FileNotFoundError):
         download.maybe_download("bogus")
+
+
+def test_concurrent_trainers_share_one_download(tmp_path, monkeypatch):
+    (tmp_path / "example.com").mkdir()
+    monkeypatch.setattr(download, "get_cache_dir", lambda: tmp_path)
+    started, second_lock, release = threading.Event(), threading.Event(), threading.Event()
+    real_lock = download.filelock.FileLock
+    lock_calls = itertools.count()
+    transfers = []
+
+    def observed_lock(*args, **kwargs):
+        if next(lock_calls) == 1:
+            second_lock.set()
+        return real_lock(*args, **kwargs)
+
+    def transfer(url, path, **kwargs):
+        transfers.append(url)
+        started.set()
+        assert release.wait(10)
+        path.write_bytes(b"weights")
+
+    monkeypatch.setattr(download.filelock, "FileLock", observed_lock)
+    monkeypatch.setattr(download, "_download_fsspec", transfer)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(download.maybe_download, "gs://example.com/weights.bin")
+        assert started.wait(10)
+        second = pool.submit(download.maybe_download, "gs://example.com/weights.bin")
+        try:
+            assert second_lock.wait(10)
+        finally:
+            release.set()
+        assert first.result() == second.result()
+    assert len(transfers) == 1
+    assert first.result().read_bytes() == b"weights"
+
+
+def test_failed_transfer_does_not_publish_cache(tmp_path, monkeypatch):
+    (tmp_path / "example.com").mkdir()
+    monkeypatch.setattr(download, "get_cache_dir", lambda: tmp_path)
+
+    class FailingFS:
+        def info(self, url):
+            return {"type": "file", "size": 7, "name": url}
+
+        def get(self, url, path, **kwargs):
+            path.write_bytes(b"partial")
+            raise OSError("transfer failed")
+
+    monkeypatch.setattr(download.fsspec.core, "url_to_fs", lambda *args, **kwargs: (FailingFS(), ""))
+    with pytest.raises(OSError, match="transfer failed"):
+        download.maybe_download("gs://example.com/weights.bin")
+    assert not (tmp_path / "example.com/weights.bin").exists()
 
 
 def test_download_gs_dir():

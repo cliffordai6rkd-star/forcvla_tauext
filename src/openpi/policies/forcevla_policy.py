@@ -6,9 +6,10 @@ from openpi import transforms
 from openpi.models import model as _model
 
 def make_forcevla_example() -> dict:
-    """Creates a random input example compatible with Flexiv config."""
+    """Creates a random example with separate proprioception and joint-torque inputs."""
     return {
-        "state": np.ones((14,)),  # observation.state, 7 ee pose, 1 gripper, 6 force
+        "state": np.ones((7,)),  # seven robot proprioception channels
+        "tau_ext": np.ones((7,)),  # external joint torques
         "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
         "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
         "prompt": "do something",
@@ -43,12 +44,20 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
         mask_padding = self.model_type == _model.ModelType.PI0
 
-        # We pad the proprioceptive input to the action dimension of the model.
-        # For pi0-FAST, we don't pad the state. For Libero, we don't need to differentiate
-        # since the pi0-FAST action_dim = 7, which is < state_dim = 8, so pad is skipped.
-        # Keep this for your own dataset, but if your dataset stores the proprioceptive input
-        # in a different key than "observation/state", you should change it below.
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
+        # Route external joint torques separately from the robot's proprioception.
+        # Discard any legacy wrench channels appended to observation.state.
+        proprio = np.asarray(data["state"])
+        tau_ext = np.asarray(data["tau_ext"])
+        if proprio.ndim < 1 or proprio.shape[-1] < 7:
+            raise ValueError("state must contain robot proprioception in its first 7 channels")
+        if tau_ext.ndim < 1 or tau_ext.shape[-1] != 7:
+            raise ValueError(f"tau_ext must have 7 channels, got shape {tau_ext.shape}")
+        if proprio.shape[:-1] != tau_ext.shape[:-1]:
+            raise ValueError("state and tau_ext must have matching batch dimensions")
+        if self.action_dim < 14:
+            raise ValueError("ForceVLA requires action_dim >= 14 to hold proprioception and tau_ext")
+        state = np.concatenate([proprio[..., :7], tau_ext], axis=-1)
+        state = transforms.pad_to_dim(state, self.action_dim)
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -58,9 +67,12 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # Pi0 models support three image inputs at the moment: one third-person view,
         # and two wrist views (left and right). If your dataset does not have a particular type
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
-        # right wrist image below.
+        # a missing wrist view below.
         base_image = _parse_image(data["image"])
-        left_wrist_image = _parse_image(data["wrist_image"])
+        left_wrist_image = _parse_image(data["wrist_image"]) if "wrist_image" in data else np.zeros_like(base_image)
+        right_wrist_image = (
+            _parse_image(data["right_wrist_image"]) if "right_wrist_image" in data else np.zeros_like(base_image)
+        )
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -69,13 +81,13 @@ class Forcevla_inputs(transforms.DataTransformFn):
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "right_wrist_0_rgb": right_wrist_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.bool_("wrist_image" in data or not mask_padding),
                 # Mask any non-existent images with False (if ``mask_padding`` is True).
-                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+                "right_wrist_0_rgb": np.bool_("right_wrist_image" in data or not mask_padding),
             },
         }
 
@@ -105,6 +117,6 @@ class Forcevla_outputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
-        # For forcevla, we only return the first 7 actions (since the rest is padding), xyz  + RPY + gripper
+        # The first 7 channels are robot actions; local v3 joint configs use all 7 as joints.
         # For your own dataset, replace `7` with the action dimension of your dataset.
         return {"actions": np.asarray(data["actions"][:, :7])}

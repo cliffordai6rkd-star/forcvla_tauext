@@ -59,6 +59,20 @@ cd flaxformer/
 pip install -e .
 ```
 ## train policy
+Local LeRobot v3 joint/torque datasets: see [dual-GPU training instructions](docs/lerobot_v3_training.md).
+
+The guidance input is now seven-dimensional external joint torque, read from
+`observation.tau_ext` (override with `--data.tau-ext-key` if needed). The first
+seven channels of legacy `observation.state` remain `xyz + rpy + gripper`;
+the local v3 configs instead read all seven joints from `observation.joint`. The input
+transform builds `[proprioception (7), tau_ext (7), padding]`; legacy wrench
+channels appended to the source state are discarded. Inference inputs provide
+`state` and `tau_ext` separately, as in `make_forcevla_example()`.
+
+Recompute normalization statistics on the torque dataset before training; old
+wrench statistics and six-input ForceVLA guidance weights are incompatible.
+The standard pi0 base checkpoint can still initialize training.
+
 ```bash
 export HF_LEROBOT_HOME="xxxxxx"
 python scripts/compute_norm_stats.py --config-name forcevla_lora 

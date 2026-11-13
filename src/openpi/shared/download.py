@@ -76,8 +76,11 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
         with filelock.FileLock(lock_path):
             # Ensure consistent permissions for the lock file.
             _ensure_permissions(lock_path)
+            # Another training process may have finished this shared download while we waited.
+            if local_path.exists() and not force_download and not _should_invalidate_cache(cache_dir, local_path):
+                return local_path
             # First, remove the existing cache if it is expired.
-            if invalidate_cache:
+            if invalidate_cache and local_path.exists():
                 logger.info(f"Removing expired cached entry: {local_path}")
                 if local_path.is_dir():
                     shutil.rmtree(local_path)
@@ -118,6 +121,7 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
             time.sleep(1)
+        future.result()  # Propagate transfer errors before publishing the cache entry.
         pbar.update(total_size - pbar.n)
 
 

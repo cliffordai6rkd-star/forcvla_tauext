@@ -25,6 +25,7 @@ import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+from openpi.training.lerobot_v3_dataset import LeRobotV3Options
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -70,6 +71,8 @@ class DataConfig:
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
+    # If set, use the local v3 reader instead of the legacy v2 LeRobot dataset.
+    lerobot_v3: LeRobotV3Options | None = None
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -413,6 +416,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
+    tau_ext_key: str = "observation.tau_ext"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -434,6 +438,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
                         "image": "observation.image",
                         "wrist_image": "observation.wrist_image",
                         "state": "observation.state",
+                        "tau_ext": self.tau_ext_key,
                         "actions": "action",
                         "prompt": "prompt",
                     }
@@ -480,6 +485,47 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
         )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotV3ForceDataConfig(DataConfigFactory):
+    dataset_root: str = tyro.MISSING
+    state_key: str = "observation.joint"
+    action_key: str = "action.joint"
+    tau_ext_key: str = "observation.tau_ext"
+    front_image_key: str = "observation.images.front"
+    right_wrist_image_key: str = "observation.images.right_wrist"
+    left_wrist_image_key: str | None = None
+    prompt: str | None = None
+    # All seven channels are joints, including the seventh (there is no gripper channel).
+    use_delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        image_keys = {"image": self.front_image_key, "right_wrist_image": self.right_wrist_image_key}
+        if self.left_wrist_image_key is not None:
+            image_keys["wrist_image"] = self.left_wrist_image_key
+        data_transforms = _transforms.Group(
+            inputs=[forcevla_policy.Forcevla_inputs(model_config.action_dim, model_config.model_type)],
+            outputs=[forcevla_policy.Forcevla_outputs()],
+        )
+        if self.use_delta_joint_actions:
+            joint_mask = _transforms.make_bool_mask(7)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(joint_mask)],
+                outputs=[_transforms.AbsoluteActions(joint_mask)],
+            )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            lerobot_v3=LeRobotV3Options(
+                root=self.dataset_root, state_key=self.state_key, action_key=self.action_key,
+                tau_ext_key=self.tau_ext_key, image_keys=image_keys, prompt=self.prompt,
+            ),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=(self.action_key,),
+            prompt_from_task=False,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -567,6 +613,33 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _pi0_force_lora_v3_config(name: str, dataset_name: str, prompt: str) -> TrainConfig:
+    model = pi0_force.Pi0_GuidanceConfig(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+    )
+    return TrainConfig(
+        name=name,
+        model=model,
+        data=LeRobotV3ForceDataConfig(
+            repo_id=dataset_name,
+            dataset_root=f"/home/djhpc/data/{dataset_name}",
+            prompt=prompt,
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=model.get_freeze_filter(),
+        ema_decay=None,
+        # Global batch: two samples per GPU on two RTX 4090s. The current
+        # four-expert MoE requires a global batch divisible by four.
+        batch_size=4,
+        fsdp_devices=2,
+        num_workers=4,
+        num_train_steps=50_000,
+        save_interval=2000,
+        keep_period=10_000,
+        wandb_enabled=False,
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -822,6 +895,12 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         batch_size=4,
+    ),
+    _pi0_force_lora_v3_config(
+        "pi0_force_lora_huanggua", "huanggua1103_25hz_3cam_lerobotv3", "Peel the cucumber.",
+    ),
+    _pi0_force_lora_v3_config(
+        "pi0_force_lora_board", "board_25hz_3cam_lerobotv3_clean", "Wipe the board.",
     ),
     #
     # Debugging configs.
