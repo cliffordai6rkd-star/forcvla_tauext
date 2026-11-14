@@ -38,6 +38,14 @@ class Policy(BasePolicy):
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
 
+    def warmup(self, obs: dict) -> None:
+        """Compile an offline prediction while preserving the sampling RNG."""
+        rng = self._rng
+        try:
+            self.infer(obs)
+        finally:
+            self._rng = rng
+
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.

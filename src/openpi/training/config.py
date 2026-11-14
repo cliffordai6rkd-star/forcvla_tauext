@@ -496,6 +496,8 @@ class LeRobotV3ForceDataConfig(DataConfigFactory):
     right_wrist_image_key: str = "observation.images.right_wrist"
     left_wrist_image_key: str | None = None
     prompt: str | None = None
+    # Serving only: the saved dataset already has this contact gate applied.
+    tau_ext_contact_threshold: float | None = None
     # All seven channels are joints, including the seventh (there is no gripper channel).
     use_delta_joint_actions: bool = True
 
@@ -626,6 +628,7 @@ def _pi0_force_lora_v3_config(name: str, dataset_name: str, prompt: str) -> Trai
             repo_id=dataset_name,
             dataset_root=f"/home/djhpc/data/{dataset_name}",
             prompt=prompt,
+            tau_ext_contact_threshold=14.0,
         ),
         weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         freeze_filter=model.get_freeze_filter(),

@@ -94,3 +94,75 @@ def test_seventh_joint_reaches_guidance_without_changing_proprioception():
     np.testing.assert_array_equal(grad[:, 7:14], 8)
     np.testing.assert_array_equal(grad[:, :7], 0)
     np.testing.assert_array_equal(grad[:, 14:], 0)
+
+
+def _deployment_observation():
+    return {
+        "state": np.zeros(7, dtype=np.float32),
+        "tau_ext": np.zeros(7, dtype=np.float32),
+        "image": np.zeros((224, 224, 3), dtype=np.uint8),
+        "right_wrist_image": np.full((224, 224, 3), 128, dtype=np.uint8),
+    }
+
+
+@pytest.mark.parametrize("tau_ext,expected", [
+    ([1] * 7, [0] * 7),
+    ([-2] * 7, [-2] * 7),  # equality is retained, including signs
+    ([3, -3, 3, -3, 3, -3, 3], [3, -3, 3, -3, 3, -3, 3]),
+])
+def test_serving_contact_gate_is_idempotent_and_precedes_normalization(tau_ext, expected):
+    validate = forcevla_policy.ForcevlaServingInputs(("image", "right_wrist_image"), 14.0)
+    observation = {**_deployment_observation(), "tau_ext": np.asarray(tau_ext, dtype=np.float32)}
+    gated = validate(observation)
+    np.testing.assert_array_equal(gated["tau_ext"], expected)
+    np.testing.assert_array_equal(validate(gated)["tau_ext"], expected)
+    np.testing.assert_array_equal(observation["tau_ext"], tau_ext)
+    inputs = forcevla_policy.Forcevla_inputs(32)(gated)
+    np.testing.assert_array_equal(inputs["state"][7:14], expected)
+    assert not inputs["image_mask"]["left_wrist_0_rgb"]
+    assert inputs["image_mask"]["right_wrist_0_rgb"]
+
+
+@pytest.mark.parametrize("bad_input", ["missing_right", "left_present"])
+def test_serving_rejects_camera_slot_mismatch(bad_input):
+    observation = _deployment_observation()
+    observation["wrist_image"] = observation["right_wrist_image"]
+    if bad_input == "missing_right":
+        del observation["right_wrist_image"]
+    with pytest.raises(ValueError, match="right_wrist_image"):
+        forcevla_policy.ForcevlaServingInputs(("image", "right_wrist_image"))(observation)
+
+
+@pytest.mark.parametrize("field", ["state", "tau_ext"])
+@pytest.mark.parametrize("values", [np.full(7, np.nan), np.full(7, np.inf), np.ones((1, 7))])
+def test_serving_rejects_nonfinite_or_batched_state(field, values):
+    observation = {**_deployment_observation(), field: values}
+    with pytest.raises(ValueError, match=field):
+        forcevla_policy.ForcevlaServingInputs(("image", "right_wrist_image"))(observation)
+
+
+@pytest.mark.parametrize("image", [
+    np.full((8, 8, 3), 255.0),
+    np.full((8, 8, 3), -1.0),
+    np.full((8, 8, 3), np.nan),
+    np.zeros((1, 8, 8, 3), dtype=np.uint8),
+    np.zeros((8, 8, 4), dtype=np.uint8),
+    np.zeros((8, 8, 3), dtype=np.uint16),
+])
+def test_reject_invalid_rgb_frame(image):
+    observation = {**_deployment_observation(), "image": image}
+    with pytest.raises(ValueError, match="[Ii]mages|RGB"):
+        forcevla_policy.Forcevla_inputs(32)(observation)
+
+
+def test_rgb_float_chw_and_uint8_hwc_represent_same_image():
+    observation = _deployment_observation()
+    image = observation["right_wrist_image"]
+    as_float = image.transpose(2, 0, 1).astype(np.float32) / 255
+    converted = forcevla_policy.Forcevla_inputs(32)({**observation, "right_wrist_image": as_float})
+    np.testing.assert_array_equal(converted["image"]["right_wrist_0_rgb"], image)
+
+
+def test_reject_nonfinite_output_actions():
+    with pytest.raises(ValueError, match="nonfinite"):
+        forcevla_policy.Forcevla_outputs()({"actions": np.full((50, 32), np.nan)})

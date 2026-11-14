@@ -1,8 +1,9 @@
 import dataclasses
-from typing import ClassVar
+
 import einops
 import numpy as np
-from openpi import transforms  
+
+from openpi import transforms
 from openpi.models import model as _model
 
 def make_forcevla_example() -> dict:
@@ -17,11 +18,57 @@ def make_forcevla_example() -> dict:
 
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
-    if np.issubdtype(image.dtype, np.floating):
-        image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    if image.ndim != 3:
+        raise ValueError(f"Images must be single RGB frames in HWC or CHW format, got {image.shape}")
+    if image.shape[-1] != 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
+    if image.shape[-1] != 3 or min(image.shape[:2]) <= 0:
+        raise ValueError(f"Images must have three RGB channels and nonempty dimensions, got {image.shape}")
+    if np.issubdtype(image.dtype, np.floating):
+        if not np.isfinite(image).all() or image.min() < 0 or image.max() > 1:
+            raise ValueError("Float RGB images must be finite and in [0, 1]; use uint8 for [0, 255]")
+        image = (255 * image).astype(np.uint8)
+    elif image.dtype != np.uint8:
+        raise ValueError(f"Images must be uint8 or float RGB in [0, 1], got {image.dtype}")
     return image
+
+
+@dataclasses.dataclass(frozen=True)
+class ForcevlaServingInputs(transforms.DataTransformFn):
+    """Validate local v3 deployment inputs before normalization.
+
+    The dataset already contains compensated, filtered and gated tau_ext.
+    Reapplying the contact gate online is idempotent; dynamics compensation
+    and causal filtering must still be performed by the robot client.
+    """
+
+    image_keys: tuple[str, ...]
+    tau_ext_contact_threshold: float | None = None
+
+    def __call__(self, data: dict) -> dict:
+        for key in self.image_keys:
+            if key not in data:
+                raise ValueError(
+                    f"Missing required camera {key!r}; send front as 'image' and right wrist as 'right_wrist_image'"
+                )
+        if "wrist_image" in data and "wrist_image" not in self.image_keys:
+            raise ValueError(
+                "This checkpoint has no left camera: omit 'wrist_image'; send right wrist as 'right_wrist_image'"
+            )
+        result = dict(data)
+        for key in ("state", "tau_ext"):
+            values = np.asarray(data[key])
+            if values.shape != (7,) or not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+                raise ValueError(f"{key} must be a single real seven-vector, without a batch dimension")
+            if not np.isfinite(values).all():
+                raise ValueError(f"{key} contains NaN or Inf")
+            result[key] = values
+        if (
+            self.tau_ext_contact_threshold is not None
+            and np.abs(result["tau_ext"].astype(np.float64)).sum() < self.tau_ext_contact_threshold
+        ):
+            result["tau_ext"] = np.zeros_like(result["tau_ext"])
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +101,8 @@ class Forcevla_inputs(transforms.DataTransformFn):
             raise ValueError(f"tau_ext must have 7 channels, got shape {tau_ext.shape}")
         if proprio.shape[:-1] != tau_ext.shape[:-1]:
             raise ValueError("state and tau_ext must have matching batch dimensions")
+        if not np.isfinite(proprio).all() or not np.isfinite(tau_ext).all():
+            raise ValueError("state and tau_ext must contain only finite values")
         if self.action_dim < 14:
             raise ValueError("ForceVLA requires action_dim >= 14 to hold proprioception and tau_ext")
         state = np.concatenate([proprio[..., :7], tau_ext], axis=-1)
@@ -119,4 +168,7 @@ class Forcevla_outputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # The first 7 channels are robot actions; local v3 joint configs use all 7 as joints.
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        actions = np.asarray(data["actions"])
+        if actions.ndim != 2 or actions.shape[1] < 7 or not np.isfinite(actions).all():
+            raise ValueError("ForceVLA returned invalid or nonfinite joint actions")
+        return {"actions": actions[:, :7]}

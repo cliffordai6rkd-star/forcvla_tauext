@@ -117,3 +117,59 @@ checkpoint 不能只缓存 prefix 的 LLM 输出。联合重算保留训练时�
 mask true、左腕 false，文本 6/48 个 token 有效。两份还原后 7 关节动作的最大
 误差分别为 0.00078 / 0.00152 rad，低于预先设定的 0.005 rad 容差；bfloat16
 跨 batch 计算仍非逐位一致。两份 `Policy.infer` 均输出 `(50, 7)` 且数值有限。
+
+## 推理服务
+
+在 `ForceVLA` 目录启动擦板服务：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+/home/djhpc/miniconda3/envs/forcevla/bin/python scripts/serve_policy.py \
+  --port 8000 \
+  policy:checkpoint \
+  --policy.config=pi0_force_lora_board \
+  --policy.dir=checkpoints/pi0_force_lora_board/board_tau_ext_b4/49999
+```
+
+本地黄瓜/擦板配置默认在监听端口前完成一次离线预热，第一次 JAX 编译可能需要
+几十秒。等到 `Policy warmup finished` 和 `server listening` 后再启动机器人客户端。
+预热只使用合成观测，保留采样随机数状态，不连接机器人。诊断冷启动时可在
+`policy:checkpoint` 前加 `--no-warmup`。
+
+服务用单独线程顺序执行推理，网络事件循环继续处理 Ping/Pong、连接与健康检查，
+因此首次编译或慢请求不会因占用网络线程而阻塞心跳。仍需将客户端首次请求的
+等待时间设得足够长（如 120 秒）；请求等待超时和 WebSocket 心跳超时是不同的设置。
+断线日志包含 code、reason、请求编号及发生阶段；每条请求记录排队和推理耗时。
+`/healthz` 返回 HTTP 200 表示服务可连接，不代表实机策略效果已经验证。
+
+客户端单次发送以下字段，不提前归一化，也不要增加 batch 维：
+
+```python
+observation = {
+    "state": joint_angles_rad,          # (7,)，J1..J7
+    "tau_ext": compensated_tau_ext_nm,  # (7,)，匹配训练的动力学补偿和因果滤波
+    "image": front_rgb_uint8,           # HWC RGB
+    "right_wrist_image": wrist_rgb_uint8,
+    "prompt": "Wipe the board.",
+}
+```
+
+本地配置缺省时会使用训练任务文本，显式提供的 prompt 优先。右腕必须用
+`right_wrist_image`；服务会拒绝缺少右腕、额外传入 `wrist_image`（左腕槽）或
+错误批次维的请求。左腕由适配器自动补黑且 mask false。浮点图像只接受有限的
+`[0, 1]`，uint8 图像接受 `[0, 255]`；服务不做 BGR 到 RGB 的自动转换。
+
+服务在归一化前补做 `sum(abs(tau_ext)) < 14 N·m` 时七维清零的 contact gate，
+等于 14 时保留；已经做过 gate 的输入不受影响。客户端仍须提供正确的外力矩，
+不能用未经补偿的电机力矩代替。NaN/Inf 状态、力矩和动作会被拒绝。
+返回动作是 `(50, 7)` 的绝对关节角 rad，不能再次叠加当前关节角。
+
+WebSocket metadata 会提供相机字段、任务文本、单位、门限和动作形状。消息上限
+默认 32 MiB，建议客户端发送 224×224 的图像；需要调整时使用启动参数
+`--max-message-size-mib`。代码更新后须重启原服务进程才能生效。
+
+服务回归已使用两份现有 `49999` 权重、默认 10 步和真实数据观测验证：黄瓜关闭
+预热时首请求约 44 秒，其间 173 次显式 Ping/Pong 全部成功，最大往返约 145 ms；
+擦板启用预热后首条网络请求约 0.44 秒。两份服务均连续返回有限的 `(50, 7)` 动作。
+这些是本机离线结果，未向机器人发送动作。

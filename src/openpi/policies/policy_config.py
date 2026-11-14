@@ -7,6 +7,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+from openpi.policies import forcevla_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -56,6 +57,28 @@ def create_trained_policy(
     model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
 
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    serving_transforms = []
+    metadata = dict(train_config.policy_metadata or {})
+    if isinstance(train_config.data, _config.LeRobotV3ForceDataConfig):
+        if default_prompt is None:
+            default_prompt = train_config.data.prompt
+        image_keys = tuple(data_config.lerobot_v3.image_keys)
+        serving_transforms.append(
+            forcevla_policy.ForcevlaServingInputs(
+                image_keys=image_keys,
+                tau_ext_contact_threshold=train_config.data.tau_ext_contact_threshold,
+            )
+        )
+        metadata.update({
+            "config": train_config.name,
+            "image_keys": list(image_keys),
+            "default_prompt": default_prompt,
+            "state_units": "rad",
+            "tau_ext_units": "Nm",
+            "tau_ext_l1_threshold_nm": train_config.data.tau_ext_contact_threshold,
+            "action_representation": "absolute_joint_positions",
+            "action_shape": [train_config.model.action_horizon, 7],
+        })
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
@@ -68,6 +91,7 @@ def create_trained_policy(
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
+            *serving_transforms,
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
@@ -79,5 +103,5 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata=metadata,
     )
